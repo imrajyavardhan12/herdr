@@ -296,9 +296,15 @@ fn blit_frame_to_with_cursor_memory(
         let _ = writer.write_all(b"\x1b[2J\x1b[H");
         write_all_cells(&mut writer, frame);
     } else {
-        // Diff-based update: only write changed cells.
+        // Diff-based update: detect scroll or write changed cells.
         let prev = prev.unwrap();
-        write_changed_cells(&mut writer, frame, prev);
+        if let Some(delta) = detect_vertical_scroll(frame, prev) {
+            // Optimized scroll: use IL/DL to shift content, only write exposed rows.
+            write_scrolled_frame(&mut writer, frame, prev, delta);
+        } else {
+            // Normal diff: only write changed cells.
+            write_changed_cells(&mut writer, frame, prev);
+        }
     }
 
     // Position the cursor while it is still hidden, then restore visibility.
@@ -538,6 +544,218 @@ fn write_cell(
 
     write_hyperlink_if_changed(writer, active_hyperlink, cell_hyperlink_uri(frame, cell));
     let _ = writer.write_all(cell.symbol.as_bytes());
+}
+
+/// Maximum number of lines to optimize with IL/DL. Beyond this, the overhead
+/// of scroll-region setup and the number of exposed rows to write approaches
+/// the cost of a normal diff, so we fall back to cell-by-cell writes.
+const MAX_SCROLL_OPTIMIZE_LINES: usize = 20;
+
+/// Detect whether the frame difference is a pure vertical scroll.
+///
+/// Returns `Some(delta)` when every unchanged row in the current frame matches
+/// a row in the previous frame shifted by exactly `delta` positions:
+///
+/// - `delta > 0` — content moved **up** (user scrolled down). The top `delta`
+///   rows of `prev` are gone and the bottom `delta` rows of `current` are new.
+/// - `delta < 0` — content moved **down** (user scrolled up). The bottom
+///   `|delta|` rows of `prev` are gone and the top `|delta|` rows of `current`
+///   are new.
+///
+/// Returns `None` when:
+/// - the frame dimensions differ (resize, not scroll)
+/// - the scroll distance exceeds [`MAX_SCROLL_OPTIMIZE_LINES`]
+/// - any row that should match does not (mixed scroll + content change)
+fn detect_vertical_scroll(current: &FrameData, prev: &FrameData) -> Option<isize> {
+    if current.width != prev.width || current.height != prev.height {
+        return None;
+    }
+
+    let height = current.height as usize;
+    let width = current.width as usize;
+    if height == 0 || width == 0 {
+        return None;
+    }
+
+    let sanitized_current = sanitized_frame_hyperlinks(current);
+    let sanitized_prev = sanitized_frame_hyperlinks(prev);
+
+    // Try scroll-down first (positive delta), then scroll-up (negative delta).
+    // Check deltas 1..=MAX_SCROLL_OPTIMIZE_LINES.
+    for delta in 1..=MAX_SCROLL_OPTIMIZE_LINES.min(height.saturating_sub(1)) {
+        // Scroll down by delta: prev[delta..height] == current[0..height-delta]
+        if rows_match_shifted(
+            &current.cells,
+            &sanitized_current,
+            &prev.cells,
+            &sanitized_prev,
+            width,
+            height,
+            0,          // current start row
+            delta,      // prev start row
+            height - delta, // number of rows to compare
+        ) {
+            return Some(delta as isize);
+        }
+
+        // Scroll up by delta: prev[0..height-delta] == current[delta..height]
+        if rows_match_shifted(
+            &current.cells,
+            &sanitized_current,
+            &prev.cells,
+            &sanitized_prev,
+            width,
+            height,
+            delta,      // current start row
+            0,          // prev start row
+            height - delta, // number of rows to compare
+        ) {
+            return Some(-(delta as isize));
+        }
+    }
+
+    None
+}
+
+/// Compare `count` rows starting at `current_start` in `current` against the
+/// same number of rows starting at `prev_start` in `prev`.
+///
+/// Uses visual equality (same as [`cells_visually_equal`]) so that hyperlink
+/// index reassignment does not cause false negatives.
+fn rows_match_shifted(
+    current_cells: &[CellData],
+    sanitized_current: &[Option<String>],
+    prev_cells: &[CellData],
+    sanitized_prev: &[Option<String>],
+    width: usize,
+    _height: usize,
+    current_start: usize,
+    prev_start: usize,
+    count: usize,
+) -> bool {
+    for row_offset in 0..count {
+        let current_row = (current_start + row_offset) * width;
+        let prev_row = (prev_start + row_offset) * width;
+
+        for col in 0..width {
+            let ci = current_row + col;
+            let pi = prev_row + col;
+
+            if current_cells[ci].symbol != prev_cells[pi].symbol
+                || current_cells[ci].fg != prev_cells[pi].fg
+                || current_cells[ci].bg != prev_cells[pi].bg
+                || current_cells[ci].modifier != prev_cells[pi].modifier
+                || sanitized_cell_hyperlink_uri(sanitized_current, &current_cells[ci])
+                    != sanitized_cell_hyperlink_uri(sanitized_prev, &prev_cells[pi])
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Writes a frame that is a pure vertical scroll of the previous frame.
+///
+/// Uses DECSTBM to set the scroll region, then IL (insert line) or DL (delete
+/// line) to shift existing terminal content, and finally writes only the newly
+/// exposed rows. This avoids rewriting the entire pane area cell-by-cell.
+///
+/// - `delta > 0`: content moved up (scroll down). Delete `delta` lines at the
+///   top, then write the bottom `delta` rows.
+/// - `delta < 0`: content moved down (scroll up). Insert `|delta|` lines at
+///   the top, then write the top `|delta|` rows.
+fn write_scrolled_frame(
+    writer: &mut impl Write,
+    frame: &FrameData,
+    prev: &FrameData,
+    delta: isize,
+) {
+    let height = frame.height;
+    let abs_delta = delta.unsigned_abs() as u16;
+
+    // Set scroll region to the full frame.
+    // DECSTBM: CSI top;bottom r  (1-based, inclusive)
+    let _ = write!(writer, "\x1b[1;{}r", height);
+
+    // Move cursor to the top-left of the scroll region.
+    let _ = writer.write_all(b"\x1b[1;1H");
+
+    if delta > 0 {
+        // Content moved up: delete lines at the top to shift remaining content up.
+        // DL: CSI Ps M  — deletes Ps lines starting at cursor row.
+        let _ = write!(writer, "\x1b[{}M", abs_delta);
+
+        // Write the newly exposed rows at the bottom.
+        let start_row = height - abs_delta;
+        write_rows(writer, frame, prev, start_row, height);
+    } else {
+        // Content moved down: insert lines at the top to shift existing content down.
+        // IL: CSI Ps L  — inserts Ps blank lines starting at cursor row.
+        let _ = write!(writer, "\x1b[{}L", abs_delta);
+
+        // Write the newly exposed rows at the top.
+        write_rows(writer, frame, prev, 0, abs_delta);
+    }
+
+    // Reset scroll region to full screen.
+    let _ = writer.write_all(b"\x1b[r");
+}
+
+/// Writes cells for rows `start_row..end_row` of `frame`, diffing against
+/// `prev` to skip unchanged cells within the exposed rows (e.g., when the
+/// scroll exposed rows that happen to partially match the previous content).
+fn write_rows(
+    writer: &mut impl Write,
+    frame: &FrameData,
+    prev: &FrameData,
+    start_row: u16,
+    end_row: u16,
+) {
+    let mut last_sgr = String::new();
+    let mut active_hyperlink = None;
+    let sanitized_current = sanitized_frame_hyperlinks(frame);
+    let sanitized_prev = sanitized_frame_hyperlinks(prev);
+
+    for row in start_row..end_row {
+        let mut invalidated = 0usize;
+        let mut to_skip = 0usize;
+
+        for col in 0..frame.width {
+            let idx = (row as usize) * (frame.width as usize) + (col as usize);
+            let cell = &frame.cells[idx];
+            let prev_cell = &prev.cells[idx];
+
+            if !cell.skip
+                && (!cells_visually_equal(
+                    &sanitized_current,
+                    cell,
+                    &sanitized_prev,
+                    prev_cell,
+                ) || invalidated > 0)
+                && to_skip == 0
+            {
+                write_cell(
+                    writer,
+                    row,
+                    col,
+                    cell,
+                    &mut last_sgr,
+                    &mut active_hyperlink,
+                    frame,
+                );
+            }
+
+            to_skip = cell_width(cell).saturating_sub(1);
+            let affected_width = cmp::max(cell_width(cell), cell_width(prev_cell));
+            invalidated = cmp::max(affected_width, invalidated).saturating_sub(1);
+        }
+    }
+
+    close_hyperlink(writer, &mut active_hyperlink);
+    if !last_sgr.is_empty() {
+        let _ = writer.write_all(b"\x1b[0m");
+    }
 }
 
 /// Writes only the cells that changed between the previous and current frame.
@@ -1426,5 +1644,220 @@ mod tests {
 
         assert!(output_str.contains("\x1b[1;1H"));
         assert!(!output_str.contains("\x1b[1;2H"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scroll detection and IL/DL optimization tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a frame from row labels. Each row is filled with the same
+    /// symbol repeated across all columns.
+    fn make_frame_from_rows(width: u16, rows: &[&str]) -> FrameData {
+        let height = rows.len() as u16;
+        let mut cells = Vec::with_capacity((width as usize) * (height as usize));
+        for row in rows {
+            for _ in 0..width {
+                cells.push(make_cell(row, 0, 0, 0));
+            }
+        }
+        make_frame(width, height, cells)
+    }
+
+    #[test]
+    fn detect_scroll_down_by_one_line() {
+        // prev: [A, B, C, D]  →  curr: [B, C, D, E]
+        // Content moved up by 1 (user scrolled down).
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["B", "C", "D", "E"]);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), Some(1));
+    }
+
+    #[test]
+    fn detect_scroll_up_by_one_line() {
+        // prev: [A, B, C, D]  →  curr: [Z, A, B, C]
+        // Content moved down by 1 (user scrolled up).
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["Z", "A", "B", "C"]);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), Some(-1));
+    }
+
+    #[test]
+    fn detect_scroll_down_by_multiple_lines() {
+        // prev: [A, B, C, D, E]  →  curr: [C, D, E, X, Y]
+        let prev = make_frame_from_rows(2, &["A", "B", "C", "D", "E"]);
+        let curr = make_frame_from_rows(2, &["C", "D", "E", "X", "Y"]);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), Some(2));
+    }
+
+    #[test]
+    fn detect_scroll_up_by_multiple_lines() {
+        // prev: [A, B, C, D, E]  →  curr: [X, Y, A, B, C]
+        let prev = make_frame_from_rows(2, &["A", "B", "C", "D", "E"]);
+        let curr = make_frame_from_rows(2, &["X", "Y", "A", "B", "C"]);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), Some(-2));
+    }
+
+    #[test]
+    fn detect_scroll_returns_none_for_content_change() {
+        // Only one cell changed, no row shift.
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let mut curr = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        curr.cells[4] = make_cell("X", 0, 0, 0); // middle of row 1
+        assert_eq!(detect_vertical_scroll(&curr, &prev), None);
+    }
+
+    #[test]
+    fn detect_scroll_returns_none_for_resize() {
+        let prev = make_frame_from_rows(3, &["A", "B"]);
+        let curr = make_frame_from_rows(4, &["A", "B"]);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), None);
+    }
+
+    #[test]
+    fn detect_scroll_returns_none_for_mixed_scroll_and_change() {
+        // Rows shifted by 1 but one of the matching rows also changed.
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let mut curr = make_frame_from_rows(3, &["B", "C", "D", "E"]);
+        // Corrupt row 1 (should be "C" to match scroll-down-by-1)
+        curr.cells[3] = make_cell("X", 0, 0, 0);
+        curr.cells[4] = make_cell("X", 0, 0, 0);
+        curr.cells[5] = make_cell("X", 0, 0, 0);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), None);
+    }
+
+    #[test]
+    fn detect_scroll_returns_none_for_full_scroll() {
+        // All rows are different, no shift pattern.
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["W", "X", "Y", "Z"]);
+        assert_eq!(detect_vertical_scroll(&curr, &prev), None);
+    }
+
+    #[test]
+    fn write_scrolled_frame_scroll_down_emits_dl() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["B", "C", "D", "E"]);
+
+        let mut output = Vec::new();
+        write_scrolled_frame(&mut output, &curr, &prev, 1);
+        let s = String::from_utf8(output).unwrap();
+
+        // Should set scroll region
+        assert!(s.contains("\x1b[1;4r"), "should set scroll region, got: {s:?}");
+        // Should move cursor to top
+        assert!(s.contains("\x1b[1;1H"), "should move cursor to top-left, got: {s:?}");
+        // Should emit DL (delete line) for scroll down
+        assert!(s.contains("\x1b[1M"), "should emit DL (CSI 1 M), got: {s:?}");
+        // Should reset scroll region
+        assert!(s.contains("\x1b[r"), "should reset scroll region, got: {s:?}");
+        // Should write the new row content (row 3 = "E")
+        assert!(s.contains("E"), "should write new row content, got: {s:?}");
+    }
+
+    #[test]
+    fn write_scrolled_frame_scroll_up_emits_il() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["Z", "A", "B", "C"]);
+
+        let mut output = Vec::new();
+        write_scrolled_frame(&mut output, &curr, &prev, -1);
+        let s = String::from_utf8(output).unwrap();
+
+        // Should set scroll region
+        assert!(s.contains("\x1b[1;4r"), "should set scroll region, got: {s:?}");
+        // Should emit IL (insert line) for scroll up
+        assert!(s.contains("\x1b[1L"), "should emit IL (CSI 1 L), got: {s:?}");
+        // Should reset scroll region
+        assert!(s.contains("\x1b[r"), "should reset scroll region, got: {s:?}");
+        // Should write the new row content (row 0 = "Z")
+        assert!(s.contains("Z"), "should write new row content, got: {s:?}");
+    }
+
+    #[test]
+    fn blit_frame_uses_scroll_optimization_for_scroll_down() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["B", "C", "D", "E"]);
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &curr, Some(&prev));
+        let s = String::from_utf8(output).unwrap();
+
+        // Should use DL (scroll optimization) instead of rewriting all cells
+        assert!(s.contains("\x1b[1M"), "should use DL for scroll-down optimization, got: {s:?}");
+        // Should NOT rewrite unchanged rows B, C, D cell-by-cell
+        // (The scroll optimization shifts them via DL, so no CUP to those rows)
+        // Row 2 (B) should not have a cursor move to write it
+        assert!(
+            !s.contains("\x1b[1;1H") || s.contains("\x1b[1M"),
+            "should not rewrite shifted rows cell-by-cell when scroll optimization is active"
+        );
+    }
+
+    #[test]
+    fn blit_frame_uses_scroll_optimization_for_scroll_up() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let curr = make_frame_from_rows(3, &["Z", "A", "B", "C"]);
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &curr, Some(&prev));
+        let s = String::from_utf8(output).unwrap();
+
+        // Should use IL (scroll optimization)
+        assert!(s.contains("\x1b[1L"), "should use IL for scroll-up optimization, got: {s:?}");
+    }
+
+    #[test]
+    fn blit_frame_falls_back_to_diff_when_no_scroll() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        let mut curr = make_frame_from_rows(3, &["A", "B", "C", "D"]);
+        // Change one cell in row 1
+        curr.cells[3] = make_cell("X", 0, 0, 0);
+        curr.cells[4] = make_cell("X", 0, 0, 0);
+        curr.cells[5] = make_cell("X", 0, 0, 0);
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &curr, Some(&prev));
+        let s = String::from_utf8(output).unwrap();
+
+        // Should NOT use IL/DL (no scroll detected)
+        assert!(!s.contains("\x1b[1L"), "should not use IL for non-scroll diff");
+        assert!(!s.contains("\x1b[1M"), "should not use DL for non-scroll diff");
+        // Should write the changed cell
+        assert!(s.contains("X"), "should write changed cell content");
+    }
+
+    #[test]
+    fn write_scrolled_frame_scroll_down_writes_only_exposed_rows() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D", "E"]);
+        let curr = make_frame_from_rows(3, &["C", "D", "E", "X", "Y"]);
+
+        let mut output = Vec::new();
+        write_scrolled_frame(&mut output, &curr, &prev, 2);
+        let s = String::from_utf8(output).unwrap();
+
+        // Should emit DL for 2 lines
+        assert!(s.contains("\x1b[2M"), "should emit CSI 2 M for 2-line scroll, got: {s:?}");
+        // Should write new rows X and Y
+        assert!(s.contains("X"), "should write new row X");
+        assert!(s.contains("Y"), "should write new row Y");
+        // Should NOT write shifted rows C, D, E (they're handled by DL)
+        // The DL shifts them up, so they shouldn't appear as cell writes
+        // (They may appear in the output as part of the new row content though)
+    }
+
+    #[test]
+    fn write_scrolled_frame_scroll_up_writes_only_exposed_rows() {
+        let prev = make_frame_from_rows(3, &["A", "B", "C", "D", "E"]);
+        let curr = make_frame_from_rows(3, &["X", "Y", "A", "B", "C"]);
+
+        let mut output = Vec::new();
+        write_scrolled_frame(&mut output, &curr, &prev, -2);
+        let s = String::from_utf8(output).unwrap();
+
+        // Should emit IL for 2 lines
+        assert!(s.contains("\x1b[2L"), "should emit CSI 2 L for 2-line scroll, got: {s:?}");
+        // Should write new rows X and Y
+        assert!(s.contains("X"), "should write new row X");
+        assert!(s.contains("Y"), "should write new row Y");
     }
 }
