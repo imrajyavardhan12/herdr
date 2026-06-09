@@ -2,9 +2,10 @@ use std::io;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    EnableFocusChange, EnableMouseCapture,
 };
+#[cfg(not(windows))]
+use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::execute;
 
 pub(crate) const HERDR_ENV_VAR: &str = "HERDR_ENV";
@@ -18,9 +19,36 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+#[cfg(not(windows))]
+fn push_keyboard_enhancement_flags() -> io::Result<()> {
+    execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
+    )
+}
+
+#[cfg(windows)]
+fn push_keyboard_enhancement_flags() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn pop_keyboard_enhancement_flags() -> io::Result<()> {
+    execute!(io::stdout(), PopKeyboardEnhancementFlags)
+}
+
+#[cfg(windows)]
+fn pop_keyboard_enhancement_flags() -> io::Result<()> {
+    Ok(())
+}
+
+mod agent_detection_policy;
 mod agent_resume;
 mod api;
 mod app;
+mod build_info;
+#[cfg(not(windows))]
+mod checksum;
 mod cli;
 mod client;
 mod config;
@@ -39,9 +67,11 @@ mod persist;
 mod platform;
 mod product_announcements;
 mod protocol;
+mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod render_prof;
 mod selection;
 mod server;
 mod session;
@@ -92,6 +122,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Use "follow" to inherit the source pane/workspace, "home" for $HOME,
 # "current" for Herdr's process directory, or a fixed path such as "~/Projects".
 # new_cwd = "follow"
+
+[update]
+# Update channel used by background checks and `herdr update`.
+# Use "stable" for normal releases or "preview" for opt-in preview builds.
+# channel = "stable"
 
 [keys]
 # Prefix key to enter prefix mode (default: "ctrl+b")
@@ -192,6 +227,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Pane apps like lazygit and btop can still receive mouse when they request it.
 # mouse_capture = true
 
+# Optional modifier that forwards right-click hold/drag gestures to pane apps instead of opening Herdr's pane menu.
+# Empty/off disables this. Shift is intentionally unsupported because terminals commonly reserve Shift+mouse.
+# right_click_passthrough_modifier = ""
+
 # Force a full redraw when the outer terminal regains focus.
 # Set false to reduce visible flashing when switching back to Herdr.
 # Trade-off: rare host terminal surface corruption may persist until the next full redraw.
@@ -220,10 +259,18 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Background notification popup delivery
 [ui.toast]
 # off = disable pop-up notifications
-# herdr = show top-right in-app toasts
+# herdr = show in-app toasts
 # terminal = ask the outer terminal to show a desktop notification
 # system = ask the OS notification service directly
 # delivery = "off"
+# delay_seconds = 1
+
+[ui.toast.herdr]
+# position = "bottom-right"
+
+[ui.toast.clipboard]
+# enabled = true
+# position = "bottom-center"
 
 # Play sounds when agents change state in background workspaces
 [ui.sound]
@@ -241,7 +288,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 [session]
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
-# resume_agents_on_restore = false
+# resume_agents_on_restore = true
+
+[remote]
+# Whether herdr manages the ssh config used for the `herdr --remote` bridge.
+# When true (default), herdr runs the bridge ssh through a generated config that
+# includes your ~/.ssh/config first and adds ServerAliveInterval/
+# ServerAliveCountMax as a fallback (so any keepalive you set yourself still
+# wins) to survive idle network/NAT timeouts. Set false to run plain ssh against
+# your ssh config unchanged — this does not force keepalive off, it only stops
+# herdr from adding its own.
+# manage_ssh_config = true
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
@@ -251,6 +308,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # kitty_graphics = false
 # Save recent pane screen history across full server restarts.
 pane_history = false
+# While prefix mode is active, temporarily switch the macOS host input
+# source to an ASCII-capable keyboard layout so prefix commands register
+# even when a CJK IME is active, then restore the previous input source
+# when prefix mode exits. macOS only; best-effort. Default: false.
+# switch_ascii_input_source_in_prefix = false
 # Expose the focused pane's cursor to the outer terminal so macOS input
 # methods keep tracking the candidate window when TUIs paint their own
 # cursor (Claude Code, pi, codex). Trade-off: extra cursor visible for
@@ -260,7 +322,7 @@ pane_history = false
 # matches one of these names. Empty means apply to any focused pane.
 # If the list contains no valid names, the reveal does not apply.
 # Accepted: pi, claude, codex, gemini, cursor, cline, opencode, copilot,
-# kimi, kiro, droid, amp, grok, hermes, qodercli, qoder.
+# kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qoder.
 # cjk_ime_agents = []
 # Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
 # Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
@@ -388,12 +450,15 @@ fn main() -> io::Result<()> {
         println!("       herdr --remote <ssh-target> [--session <name>]");
         println!("       herdr session attach <name>");
         println!("       herdr update [--handoff]");
+        println!("       herdr channel set <stable|preview>");
         println!("       herdr server stop");
         println!("       herdr server reload-config");
         println!("       herdr config <subcommand> ...");
+        println!("       herdr channel <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
+        println!("       herdr notification <subcommand> ...");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr wait <subcommand> ...");
@@ -413,12 +478,20 @@ fn main() -> io::Result<()> {
                 "Stop the running server via the API socket",
             ),
             (
+                "herdr channel set <stable|preview>",
+                "Choose the stable or preview update channel",
+            ),
+            (
                 "herdr server reload-config",
                 "Reload config.toml in the running server",
             ),
             (
                 "herdr config reset-keys",
                 "Back up config.toml and remove custom keybindings",
+            ),
+            (
+                "herdr channel <subcommand>",
+                "Manage the stable or preview update channel",
             ),
             (
                 "herdr workspace <subcommand>",
@@ -429,6 +502,10 @@ fn main() -> io::Result<()> {
                 "Git worktree helpers over the socket API",
             ),
             ("herdr tab <subcommand>", "Tab helpers over the socket API"),
+            (
+                "herdr notification <subcommand>",
+                "Notification helpers over the socket API",
+            ),
             (
                 "herdr agent <subcommand>",
                 "Agent/terminal helpers over the socket API",
@@ -475,7 +552,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("herdr {}", env!("CARGO_PKG_VERSION"));
+        println!("herdr {}", crate::build_info::version());
         return Ok(());
     }
 
@@ -511,6 +588,7 @@ fn main() -> io::Result<()> {
                 "update",
                 "status",
                 "config",
+                "channel",
                 "workspace",
                 "worktree",
                 "pane",
@@ -580,11 +658,11 @@ fn main() -> io::Result<()> {
         }
         let _ = execute!(
             io::stdout(),
-            PopKeyboardEnhancementFlags,
             DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture
         );
+        let _ = pop_keyboard_enhancement_flags();
         ratatui::restore();
         original_hook(info);
     }));
@@ -609,12 +687,8 @@ fn main() -> io::Result<()> {
         } else {
             execute!(io::stdout(), DisableMouseCapture)?;
         }
-        execute!(
-            io::stdout(),
-            EnableBracketedPaste,
-            EnableFocusChange,
-            PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
-        )?;
+        execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
+        push_keyboard_enhancement_flags()?;
 
         // Some hosts do not honor Kitty keyboard enhancement pushes for
         // Shift+Enter. Enable xterm modifyOtherKeys only on hosts where we
@@ -644,9 +718,9 @@ fn main() -> io::Result<()> {
         if crate::kitty_graphics::is_enabled() {
             crate::kitty_graphics::clear_all_host_graphics()?;
         }
+        pop_keyboard_enhancement_flags()?;
         execute!(
             io::stdout(),
-            PopKeyboardEnhancementFlags,
             DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture

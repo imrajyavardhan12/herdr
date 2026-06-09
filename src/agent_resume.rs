@@ -25,12 +25,6 @@ pub struct AgentResumePlan {
     pub dedupe_key: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AgentResumeLaunch<'a> {
-    pub plan: &'a AgentResumePlan,
-    pub initial_history_ansi: Option<&'a str>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAgentSession {
     pub source: String,
@@ -75,6 +69,19 @@ pub fn session_ref_from_report(
     agent_session_id.and_then(AgentSessionRef::id)
 }
 
+pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
+    matches!(
+        (source, agent),
+        ("herdr:claude", "claude")
+            | ("herdr:codex", "codex")
+            | ("herdr:copilot", "copilot")
+            | ("herdr:droid", "droid")
+            | ("herdr:kimi", "kimi")
+            | ("herdr:qodercli", "qodercli")
+            | ("herdr:cursor", "cursor")
+    )
+}
+
 pub fn session_ref_from_snapshot(
     source: &str,
     agent: &str,
@@ -112,6 +119,15 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]
         }
+        ("herdr:copilot", "copilot", AgentSessionRefKind::Id) => {
+            vec!["copilot".into(), format!("--resume={}", session_ref.value)]
+        }
+        ("herdr:droid", "droid", AgentSessionRefKind::Id) => {
+            vec!["droid".into(), "--resume".into(), session_ref.value.clone()]
+        }
+        ("herdr:kimi", "kimi", AgentSessionRefKind::Id) => {
+            vec!["kimi".into(), "--session".into(), session_ref.value.clone()]
+        }
         ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
@@ -126,6 +142,23 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
             vec![
                 "opencode".into(),
                 "--session".into(),
+                session_ref.value.clone(),
+            ]
+        }
+        ("herdr:qodercli", "qodercli", AgentSessionRefKind::Id) => {
+            vec![
+                "qodercli".into(),
+                "--resume".into(),
+                session_ref.value.clone(),
+            ]
+        }
+        ("herdr:kilo", "kilo", AgentSessionRefKind::Id) => {
+            vec!["kilo".into(), "--session".into(), session_ref.value.clone()]
+        }
+        ("herdr:cursor", "cursor", AgentSessionRefKind::Id) => {
+            vec![
+                "cursor-agent".into(),
+                "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
@@ -151,9 +184,15 @@ fn is_official_agent_source(source: &str, agent: &str) -> bool {
         (source, agent),
         ("herdr:claude", "claude")
             | ("herdr:codex", "codex")
+            | ("herdr:copilot", "copilot")
+            | ("herdr:droid", "droid")
+            | ("herdr:kimi", "kimi")
             | ("herdr:pi", "pi")
             | ("herdr:hermes", "hermes")
             | ("herdr:opencode", "opencode")
+            | ("herdr:qodercli", "qodercli")
+            | ("herdr:kilo", "kilo")
+            | ("herdr:cursor", "cursor")
     )
 }
 
@@ -172,8 +211,17 @@ fn valid_session_path(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn absolute_test_path(name: &str) -> String {
+        std::env::current_dir()
+            .unwrap()
+            .join(name)
+            .display()
+            .to_string()
+    }
+
     #[test]
     fn planner_allows_supported_agents() {
+        let pi_session = absolute_test_path("pi-session.jsonl");
         assert_eq!(
             plan(
                 "herdr:claude",
@@ -196,13 +244,43 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:pi",
-                "pi",
-                &AgentSessionRef::path("/tmp/pi-session.jsonl").unwrap()
+                "herdr:copilot",
+                "copilot",
+                &AgentSessionRef::id("copilot-session").unwrap()
             )
             .unwrap()
             .argv,
-            vec!["pi", "--session", "/tmp/pi-session.jsonl"]
+            vec!["copilot", "--resume=copilot-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:droid",
+                "droid",
+                &AgentSessionRef::id("droid-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["droid", "--resume", "droid-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:kimi",
+                "kimi",
+                &AgentSessionRef::id("kimi-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["kimi", "--session", "kimi-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:pi",
+                "pi",
+                &AgentSessionRef::path(&pi_session).unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["pi", "--session", pi_session.as_str()]
         );
         assert_eq!(
             plan(
@@ -224,10 +302,41 @@ mod tests {
             .argv,
             vec!["opencode", "--session", "opencode-session"]
         );
+        assert_eq!(
+            plan(
+                "herdr:qodercli",
+                "qodercli",
+                &AgentSessionRef::id("qoder-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["qodercli", "--resume", "qoder-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:kilo",
+                "kilo",
+                &AgentSessionRef::id("kilo-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["kilo", "--session", "kilo-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:cursor",
+                "cursor",
+                &AgentSessionRef::id("cursor-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["cursor-agent", "--resume", "cursor-session"]
+        );
     }
 
     #[test]
     fn planner_rejects_custom_and_unsupported_path_refs() {
+        let claude_session = absolute_test_path("claude-session");
         assert!(plan(
             "custom:claude",
             "claude",
@@ -237,22 +346,25 @@ mod tests {
         assert!(plan(
             "herdr:claude",
             "claude",
-            &AgentSessionRef::path("/tmp/claude-session").unwrap()
+            &AgentSessionRef::path(&claude_session).unwrap()
         )
         .is_none());
     }
 
     #[test]
     fn report_ref_prefers_pi_path_and_validates_values() {
+        let pi_session = absolute_test_path("pi-session.jsonl");
+        let claude_session = absolute_test_path("claude-session");
+        let copilot_session = absolute_test_path("copilot-session");
         let session_ref = session_ref_from_report(
             "herdr:pi",
             "pi",
             Some("pi-id".into()),
-            Some("/tmp/pi-session.jsonl".into()),
+            Some(pi_session.clone()),
         )
         .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Path);
-        assert_eq!(session_ref.value, "/tmp/pi-session.jsonl");
+        assert_eq!(session_ref.value, pi_session);
 
         assert!(session_ref_from_report("herdr:pi", "pi", Some("bad\nid".into()), None).is_none());
         assert!(
@@ -260,34 +372,92 @@ mod tests {
                 .is_none()
         );
         assert!(session_ref_from_report("custom:pi", "pi", Some("pi-id".into()), None).is_none());
+        assert!(
+            session_ref_from_report("herdr:claude", "claude", None, Some(claude_session)).is_none()
+        );
+
+        let session_ref =
+            session_ref_from_report("herdr:copilot", "copilot", Some("copilot-id".into()), None)
+                .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "copilot-id");
+        assert!(
+            session_ref_from_report("herdr:copilot", "copilot", None, Some(copilot_session))
+                .is_none()
+        );
+
+        let session_ref =
+            session_ref_from_report("herdr:droid", "droid", Some("droid-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "droid-id");
         assert!(session_ref_from_report(
-            "herdr:claude",
-            "claude",
+            "herdr:droid",
+            "droid",
             None,
-            Some("/tmp/claude-session".into())
+            Some("/tmp/droid-session".into())
         )
         .is_none());
+
+        let session_ref =
+            session_ref_from_report("herdr:kimi", "kimi", Some("kimi-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "kimi-id");
+
+        let session_ref =
+            session_ref_from_report("herdr:kilo", "kilo", Some("kilo-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "kilo-id");
+
+        let session_ref =
+            session_ref_from_report("herdr:qodercli", "qodercli", Some("qoder-id".into()), None)
+                .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "qoder-id");
     }
 
     #[test]
     fn ids_are_data_not_shell_text() {
         let id = "abc; rm -rf /";
-        let plan = plan("herdr:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
-        assert_eq!(plan.argv, vec!["codex", "resume", id]);
+        let codex_plan = plan("herdr:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
+        assert_eq!(codex_plan.argv, vec!["codex", "resume", id]);
+
+        let copilot_plan = plan(
+            "herdr:copilot",
+            "copilot",
+            &AgentSessionRef::id(id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(copilot_plan.argv, vec!["copilot", "--resume=abc; rm -rf /"]);
     }
 
     #[test]
     fn planner_rejects_path_refs_for_id_only_agents() {
+        let hermes_session = absolute_test_path("hermes-session");
+        let opencode_session = absolute_test_path("opencode-session");
+        let kilo_session = absolute_test_path("kilo-session");
+        let copilot_session = absolute_test_path("copilot-session");
         assert!(plan(
             "herdr:hermes",
             "hermes",
-            &AgentSessionRef::path("/tmp/hermes-session").unwrap()
+            &AgentSessionRef::path(&hermes_session).unwrap()
         )
         .is_none());
         assert!(plan(
             "herdr:opencode",
             "opencode",
-            &AgentSessionRef::path("/tmp/opencode-session").unwrap()
+            &AgentSessionRef::path(&opencode_session).unwrap()
+        )
+        .is_none());
+        assert!(plan(
+            "herdr:kilo",
+            "kilo",
+            &AgentSessionRef::path(&kilo_session).unwrap()
+        )
+        .is_none());
+        assert!(plan(
+            "herdr:copilot",
+            "copilot",
+            &AgentSessionRef::path(&copilot_session).unwrap()
         )
         .is_none());
         assert!(session_ref_from_snapshot(
@@ -302,6 +472,20 @@ mod tests {
             "opencode",
             AgentSessionRefKind::Id,
             "opencode-session"
+        )
+        .is_some());
+        assert!(session_ref_from_snapshot(
+            "herdr:kilo",
+            "kilo",
+            AgentSessionRefKind::Id,
+            "kilo-session"
+        )
+        .is_some());
+        assert!(session_ref_from_snapshot(
+            "herdr:copilot",
+            "copilot",
+            AgentSessionRefKind::Id,
+            "copilot-session"
         )
         .is_some());
     }

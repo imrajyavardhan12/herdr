@@ -40,8 +40,8 @@ use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
-    release_notes_display_lines, release_notes_sections, release_notes_wrapped_line_count,
-    PRODUCT_ANNOUNCEMENT_MODAL_SIZE, RELEASE_NOTES_MODAL_SIZE,
+    release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
+    RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
 pub(crate) use self::scrollbar::{
@@ -51,7 +51,7 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
-    render_config_diagnostic, render_copy_feedback, render_toast_notification,
+    copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
 };
 use self::tabs::render_tab_bar;
@@ -59,17 +59,19 @@ pub(crate) use self::{
     dialogs::{
         confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
-        open_existing_worktree_inner_rect, open_existing_worktree_visible_start,
-        remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
+        open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
+        open_existing_worktree_visible_start, remove_worktree_button_rects,
+        remove_worktree_popup_rect, rename_button_rects,
     },
     settings::{settings_button_rects, settings_show_primary_action},
     sidebar::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
         agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        normalized_workspace_scroll, sidebar_section_divider_rect, workspace_drop_indicator_row,
-        workspace_list_entries, workspace_list_rect, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, WorkspaceListEntry,
+        expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
+        workspace_drop_indicator_row, workspace_list_entries, workspace_list_rect,
+        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
+        WorkspaceListEntry,
     },
 };
 pub(crate) use self::{
@@ -252,7 +254,14 @@ fn compute_view_internal(
     let toast_hit_area = app
         .toast
         .as_ref()
-        .map(|toast| toast_notification_rect(terminal_area, toast, app.config_diagnostic.is_some()))
+        .map(|toast| {
+            toast_notification_rect(
+                area,
+                toast,
+                app.config_diagnostic.is_some(),
+                toast.position.unwrap_or(app.toast_config.herdr.position),
+            )
+        })
         .unwrap_or_default();
 
     app.view = crate::app::ViewState {
@@ -399,7 +408,7 @@ pub fn render_with_runtime_registry(
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
-        Mode::Navigator => render_navigator_overlay(app, frame),
+        Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
     }
 }
@@ -410,6 +419,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         render_config_diagnostic(frame, terminal_area, message, &app.palette);
     }
     let mut copy_feedback_offset = u16::from(has_config_diagnostic);
+    let mut toast_rect = None;
     if let Some(toast) = &app.toast {
         if app.view.layout == ViewLayout::Mobile {
             render_mobile_toast_banner(
@@ -422,18 +432,25 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         } else {
             render_toast_notification(
                 frame,
-                terminal_area,
+                frame.area(),
                 toast,
                 has_config_diagnostic,
+                toast.position.unwrap_or(app.toast_config.herdr.position),
                 &app.palette,
             );
+            toast_rect = Some(toast_notification_rect(
+                frame.area(),
+                toast,
+                has_config_diagnostic,
+                toast.position.unwrap_or(app.toast_config.herdr.position),
+            ));
         }
-        copy_feedback_offset =
-            copy_feedback_offset.saturating_add(if app.view.layout == ViewLayout::Mobile {
-                1
-            } else {
-                toast_notification_rect(terminal_area, toast, has_config_diagnostic).height
-            });
+        if app.view.layout == ViewLayout::Mobile {
+            toast_rect = Some(mobile_toast_banner_rect(
+                frame.area(),
+                has_config_diagnostic,
+            ));
+        }
     }
     if let Some(feedback) = &app.copy_feedback {
         let area = if app.view.layout == ViewLayout::Mobile {
@@ -441,8 +458,46 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         } else {
             terminal_area
         };
-        render_copy_feedback(frame, area, feedback, copy_feedback_offset, &app.palette);
+        if let Some(toast_rect) = toast_rect {
+            copy_feedback_offset = copy_feedback_offset_for_toast(
+                area,
+                feedback,
+                copy_feedback_offset,
+                app.toast_config.clipboard.position,
+                toast_rect,
+            );
+        }
+        render_copy_feedback(
+            frame,
+            area,
+            feedback,
+            copy_feedback_offset,
+            app.toast_config.clipboard.position,
+            &app.palette,
+        );
     }
+}
+
+fn copy_feedback_offset_for_toast(
+    area: Rect,
+    feedback: &crate::app::state::CopyFeedback,
+    base_offset: u16,
+    position: crate::config::ToastClipboardPosition,
+    toast_rect: Rect,
+) -> u16 {
+    let feedback_rect = copy_feedback_rect(area, feedback, base_offset, position);
+    if rects_overlap(feedback_rect, toast_rect) {
+        base_offset.saturating_add(toast_rect.height)
+    } else {
+        base_offset
+    }
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x.saturating_add(b.width)
+        && b.x < a.x.saturating_add(a.width)
+        && a.y < b.y.saturating_add(b.height)
+        && b.y < a.y.saturating_add(a.height)
 }
 
 fn dim_background(frame: &mut Frame, area: Rect) {
@@ -477,6 +532,50 @@ mod tests {
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {
+        let area = Rect::new(0, 0, 80, 24);
+        let feedback = crate::app::state::CopyFeedback {
+            message: "copied to clipboard".into(),
+        };
+        let toast = crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "workspace · 1".into(),
+            position: None,
+            target: None,
+        };
+
+        let bottom_right_toast = toast_notification_rect(
+            area,
+            &toast,
+            false,
+            crate::config::ToastHerdrPosition::BottomRight,
+        );
+        assert_eq!(
+            copy_feedback_offset_for_toast(
+                area,
+                &feedback,
+                0,
+                crate::config::ToastClipboardPosition::TopCenter,
+                bottom_right_toast,
+            ),
+            0
+        );
+
+        let bottom_center_toast = Rect::new(28, 21, 24, 3);
+        assert_eq!(
+            copy_feedback_offset_for_toast(
+                area,
+                &feedback,
+                0,
+                crate::config::ToastClipboardPosition::BottomCenter,
+                bottom_center_toast,
+            ),
+            bottom_center_toast.height
+        );
+    }
 
     #[tokio::test]
     async fn focused_pane_cursor_wins_during_terminal_render() {
@@ -537,6 +636,53 @@ mod tests {
             app.view.mobile_menu_hit_area.x + app.view.mobile_menu_hit_area.width,
             44
         );
+    }
+
+    #[test]
+    fn desktop_toast_hit_area_uses_full_frame_not_terminal_area() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        app.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "one".into(),
+            position: None,
+            target: None,
+        });
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.layout, ViewLayout::Desktop);
+        assert!(app.view.terminal_area.x > 0);
+        assert_eq!(app.view.toast_hit_area.x, 0);
+        assert_eq!(app.view.toast_hit_area.y, 0);
+    }
+
+    #[test]
+    fn desktop_toast_hit_area_still_offsets_for_config_diagnostic() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.config_diagnostic = Some("config warning".into());
+        app.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        app.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "one".into(),
+            position: None,
+            target: None,
+        });
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.toast_hit_area.x, 0);
+        assert_eq!(app.view.toast_hit_area.y, 1);
     }
 
     #[test]

@@ -2,11 +2,12 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=opencode
-// HERDR_INTEGRATION_VERSION=3
+// HERDR_INTEGRATION_VERSION=5
 
 import net from "node:net";
 
 const SOURCE = "herdr:opencode";
+const AGENT = "opencode";
 let reportSeq = Date.now() * 1000;
 
 function nextReportSeq() {
@@ -20,7 +21,26 @@ function sessionIDFromProperties(properties) {
     : undefined;
 }
 
-function reportState(action, sessionID) {
+function stateFromSessionStatus(status) {
+  if (typeof status !== "string") {
+    return undefined;
+  }
+  switch (status.toLowerCase()) {
+    case "idle":
+      return "idle";
+    case "active":
+    case "busy":
+    case "pending":
+    case "running":
+    case "streaming":
+    case "working":
+      return "working";
+    default:
+      return undefined;
+  }
+}
+
+function request(method, params) {
   const paneId = process.env.HERDR_PANE_ID;
   const socketPath = process.env.HERDR_SOCKET_PATH;
 
@@ -31,26 +51,16 @@ function reportState(action, sessionID) {
   const requestId = `${SOURCE}:${Date.now()}:${Math.floor(Math.random() * 1_000_000)
     .toString()
     .padStart(6, "0")}`;
-  const params =
-    action === "release"
-      ? {
-          pane_id: paneId,
-          source: SOURCE,
-          agent: "opencode",
-          seq: nextReportSeq(),
-        }
-      : {
-          pane_id: paneId,
-          source: SOURCE,
-          agent: "opencode",
-          state: action,
-          seq: nextReportSeq(),
-          ...(sessionID ? { agent_session_id: sessionID } : {}),
-        };
   const request = {
     id: requestId,
-    method: action === "release" ? "pane.release_agent" : "pane.report_agent",
-    params,
+    method,
+    params: {
+      pane_id: paneId,
+      source: SOURCE,
+      agent: AGENT,
+      seq: nextReportSeq(),
+      ...params,
+    },
   };
 
   return new Promise((resolve) => {
@@ -71,6 +81,25 @@ function reportState(action, sessionID) {
   });
 }
 
+function reportSession(sessionID) {
+  if (!sessionID) {
+    return Promise.resolve();
+  }
+  return request("pane.report_agent_session", { agent_session_id: sessionID });
+}
+
+function reportState(state, sessionID) {
+  const params = { state };
+  if (sessionID) {
+    params.agent_session_id = sessionID;
+  }
+  return request("pane.report_agent", params);
+}
+
+function releaseAgent() {
+  return request("pane.release_agent", {});
+}
+
 export const HerdrAgentStatePlugin = async () => {
   if (
     process.env.HERDR_ENV !== "1" ||
@@ -81,8 +110,8 @@ export const HerdrAgentStatePlugin = async () => {
   }
 
   return {
-    dispose: async () => {
-      await reportState("release");
+    "chat.message": async ({ sessionID }) => {
+      await reportState("working", sessionID);
     },
     event: async ({ event }) => {
       const type = event?.type;
@@ -90,44 +119,37 @@ export const HerdrAgentStatePlugin = async () => {
       const sessionID = sessionIDFromProperties(properties);
 
       switch (type) {
-        case "permission.asked":
-        case "question.asked":
-          await reportState("blocked", sessionID);
-          break;
-        case "permission.replied": {
-          const reply = properties.reply ?? properties.response;
-          if (reply === "reject") {
-            await reportState("idle", sessionID);
-          } else if (reply === "once" || reply === "always") {
-            await reportState("working", sessionID);
-          }
-          break;
-        }
-        case "question.replied":
-          await reportState("working", sessionID);
-          break;
-        case "question.rejected":
-          await reportState("idle", sessionID);
-          break;
         case "session.created":
         case "session.updated":
-          // session.created and session.updated are metadata events; lifecycle
-          // state comes from session.status and the deprecated session.idle.
+          await reportSession(sessionID);
           break;
         case "session.status": {
-          const status =
-            typeof properties.status === "string"
-              ? properties.status
-              : properties.status?.type;
-          if (status === "busy" || status === "retry") {
-            await reportState("working", sessionID);
-          } else if (status === "idle") {
-            await reportState("idle", sessionID);
+          const state = stateFromSessionStatus(properties.status);
+          if (state) {
+            await reportState(state, sessionID);
+          } else {
+            await reportSession(sessionID);
           }
           break;
         }
+        case "tool.execute.before":
+        case "tool.execute.after":
+        case "permission.replied":
+        case "question.replied":
+        case "question.rejected":
+        case "session.compacted":
+          await reportState("working", sessionID);
+          break;
+        case "permission.asked":
+        case "question.asked":
+        case "session.error":
+          await reportState("blocked", sessionID);
+          break;
         case "session.idle":
           await reportState("idle", sessionID);
+          break;
+        case "session.deleted":
+          await releaseAgent();
           break;
         default:
           break;

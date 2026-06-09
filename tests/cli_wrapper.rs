@@ -500,6 +500,14 @@ fn run_codex_hook(action: &str, hook_input: &str) -> Option<serde_json::Value> {
     )
 }
 
+fn run_copilot_hook(hook_input: &str) -> Option<serde_json::Value> {
+    run_shell_hook(
+        "src/integration/assets/copilot/herdr-agent-state.sh",
+        &[],
+        hook_input,
+    )
+}
+
 fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
@@ -560,19 +568,11 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
 }
 
 #[test]
-fn claude_hook_reports_subagent_working_and_blocked() {
+fn claude_hook_ignores_state_actions() {
     let subagent_input = r#"{"hook_event_name":"Notification","agent_id":"agent-abc123","agent_type":"Explore","notification_type":"permission_prompt"}"#;
 
-    let working =
-        run_claude_hook("working", subagent_input).expect("subagent working should report working");
-    assert_eq!(working["method"], "pane.report_agent");
-    assert_eq!(working["params"]["state"], "working");
-    assert!(working["params"]["seq"].as_u64().is_some());
-
-    let blocked =
-        run_claude_hook("blocked", subagent_input).expect("subagent blocked should report blocked");
-    assert_eq!(blocked["method"], "pane.report_agent");
-    assert_eq!(blocked["params"]["state"], "blocked");
+    assert!(run_claude_hook("working", subagent_input).is_none());
+    assert!(run_claude_hook("blocked", subagent_input).is_none());
 }
 
 #[test]
@@ -590,36 +590,73 @@ fn claude_hook_keeps_parent_agent_type_only_blocked() {
     let request = run_claude_hook(
         "blocked",
         r#"{"hook_event_name":"PermissionRequest","agent_type":"Explore"}"#,
-    )
-    .expect("parent blocked should still report blocked");
+    );
 
-    assert_eq!(request["method"], "pane.report_agent");
-    assert_eq!(request["params"]["state"], "blocked");
+    assert!(request.is_none());
 }
 
 #[test]
 fn claude_hook_reports_session_id_from_stdin() {
     let request = run_claude_hook(
-        "idle",
+        "session",
         r#"{"hook_event_name":"SessionStart","session_id":"claude-session"}"#,
     )
-    .expect("session start should report idle");
+    .expect("session start should report session identity");
 
-    assert_eq!(request["method"], "pane.report_agent");
+    assert_eq!(request["method"], "pane.report_agent_session");
     assert_eq!(request["params"]["agent_session_id"], "claude-session");
+    assert!(request["params"].get("state").is_none());
 }
 
 #[test]
 fn codex_hook_reports_session_id_from_stdin() {
     let request = run_codex_hook(
-        "working",
+        "session",
         r#"{"hook_event_name":"SessionStart","session_id":"codex-session"}"#,
     )
-    .expect("codex hook should report working");
+    .expect("codex hook should report session identity");
 
-    assert_eq!(request["method"], "pane.report_agent");
-    assert_eq!(request["params"]["state"], "working");
+    assert_eq!(request["method"], "pane.report_agent_session");
     assert_eq!(request["params"]["agent_session_id"], "codex-session");
+    assert!(request["params"].get("state").is_none());
+}
+
+#[test]
+fn copilot_hook_reports_session_id_from_stdin() {
+    let request = run_copilot_hook(
+        r#"{"hook_event_name":"SessionStart","session_id":"copilot-session","source":"resume"}"#,
+    )
+    .expect("copilot session start should report session identity");
+
+    assert_eq!(request["method"], "pane.report_agent_session");
+    assert_eq!(request["params"]["agent"], "copilot");
+    assert_eq!(request["params"]["agent_session_id"], "copilot-session");
+    assert!(request["params"].get("state").is_none());
+
+    let camel = run_copilot_hook(
+        r#"{"sessionId":"copilot-camel-session","source":"new","initialPrompt":"run tests"}"#,
+    )
+    .expect("copilot camelCase session start should report session identity");
+
+    assert_eq!(camel["method"], "pane.report_agent_session");
+    assert_eq!(camel["params"]["agent_session_id"], "copilot-camel-session");
+    assert!(camel["params"].get("state").is_none());
+}
+
+#[test]
+fn copilot_hook_does_not_report_lifecycle_state() {
+    for payload in [
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"copilot-session","prompt":"run tests"}"#,
+        r#"{"hook_event_name":"PreToolUse","session_id":"copilot-session","tool_name":"ask_user"}"#,
+        r#"{"hook_event_name":"notification","session_id":"copilot-session","notification_type":"permission_prompt"}"#,
+        r#"{"hook_event_name":"agentStop","session_id":"copilot-session","stop_reason":"end_turn"}"#,
+        r#"{"hook_event_name":"SessionEnd","session_id":"copilot-session","reason":"user_exit"}"#,
+    ] {
+        assert!(
+            run_copilot_hook(payload).is_none(),
+            "copilot session-only hook should ignore lifecycle payload {payload}"
+        );
+    }
 }
 
 #[test]
@@ -722,8 +759,6 @@ fn pane_report_metadata_sends_presentation_request() {
             "user:claude-title",
             "--agent",
             "claude",
-            "--applies-to-source",
-            "herdr:claude",
             "--title",
             "Refactor auth",
             "--display-agent",
@@ -748,7 +783,7 @@ fn pane_report_metadata_sends_presentation_request() {
     assert_eq!(request["params"]["pane_id"], "1-1");
     assert_eq!(request["params"]["source"], "user:claude-title");
     assert_eq!(request["params"]["agent"], "claude");
-    assert_eq!(request["params"]["applies_to_source"], "herdr:claude");
+    assert!(request["params"]["applies_to_source"].is_null());
     assert_eq!(request["params"]["title"], "Refactor auth");
     assert_eq!(request["params"]["display_agent"], "Claude auth");
     assert_eq!(request["params"]["custom_status"], "middleware");
@@ -1238,7 +1273,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 12"),
+        full_stdout.contains("  protocol: 13"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -1271,7 +1306,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 12"),
+        server_stdout.contains("protocol: 13"),
         "stdout: {server_stdout}"
     );
 
@@ -1283,7 +1318,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 12"),
+        client_stdout.contains("protocol: 13"),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -1293,7 +1328,7 @@ fn status_commands_report_client_and_server_versions() {
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(full_json["client"]["protocol"], 12);
+    assert_eq!(full_json["client"]["protocol"], 13);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
     assert_eq!(full_json["server"]["compatible"], true);
@@ -1307,12 +1342,12 @@ fn status_commands_report_client_and_server_versions() {
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(server_json["protocol"], 12);
+    assert_eq!(server_json["protocol"], 13);
     assert_eq!(server_json["compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
     assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(client_json["protocol"], 12);
+    assert_eq!(client_json["protocol"], 13);
     assert!(client_json["binary"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));
@@ -1957,11 +1992,15 @@ fn agent_start_command_works() {
             "/bin/sh",
             "-c",
             "printf cli-agent-start-ok; sleep 2",
+            "--session",
+            "child-session",
         ],
     );
     assert_eq!(started["result"]["type"], "agent_started");
     assert_eq!(started["result"]["agent"]["name"], "main");
     assert_eq!(started["result"]["argv"][0], "/bin/sh");
+    assert_eq!(started["result"]["argv"][3], "--session");
+    assert_eq!(started["result"]["argv"][4], "child-session");
     let terminal_id = started["result"]["agent"]["terminal_id"]
         .as_str()
         .unwrap()
@@ -2615,7 +2654,7 @@ fn wait_agent_status_exits_when_idle_status_matches() {
     let fake_pi = bin_dir.join("pi");
     fs::write(
         &fake_pi,
-        "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+        "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -2658,7 +2697,7 @@ fn wait_agent_status_exits_when_idle_status_matches() {
             "--status",
             "idle",
             "--timeout",
-            "5000",
+            "10000",
         ],
     );
     assert!(
@@ -2743,7 +2782,7 @@ fn wait_agent_status_exits_when_done_status_matches() {
     let fake_pi = bin_dir.join("pi");
     fs::write(
         &fake_pi,
-        "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+        "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -2798,7 +2837,7 @@ fn wait_agent_status_exits_when_done_status_matches() {
             "--status",
             "done",
             "--timeout",
-            "5000",
+            "10000",
         ],
     );
     assert!(
